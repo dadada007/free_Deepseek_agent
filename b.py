@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepSeek Browser API - OpenAI 兼容代理 终极版 v10.2 (会话稳定性修复)
+DeepSeek Browser API - OpenAI 兼容代理 终极版 v10.4 (简化稳定性修复)
 ================================================================
 修复内容：
-- 移除过于严格的哈希匹配检查
-- 会话超时时间延长到24小时
-- 会话自动恢复机制增强
-- 页面健康检查更宽容
+- 移除复杂的恢复逻辑
+- 直接使用现有页面
+- 只发送新消息
+- 超时不重建页面
 """
 import os
 import sys
@@ -75,14 +75,12 @@ STORAGE_FILE = DATA_DIR / "storage.json"
 DEEPSEEK_URL = "https://chat.deepseek.com/"
 
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "100"))
-SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "86400"))  # 改为24小时
+SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "86400"))  # 24小时
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "4"))
 REPLY_TIMEOUT = int(os.environ.get("REPLY_TIMEOUT", "300"))
 LOGIN_TIMEOUT = int(os.environ.get("LOGIN_TIMEOUT", "300"))
 MAX_REQUEST_SIZE = int(os.environ.get("MAX_REQUEST_SIZE", str(10 * 1024 * 1024)))
-HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))  # 改为60秒
-
-_UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "sk-admin")
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "120"))  # 2分钟
 
 _API_KEYS = [
     k.strip() for k in
@@ -121,13 +119,11 @@ def _require_auth(request: Request):
 class ChatSession:
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     page: Any = None
-    sent_hashes: List[str] = field(default_factory=list)
+    sent_message_ids: List[str] = field(default_factory=list)  # 已发送消息ID
     last_activity: float = field(default_factory=time.time)
     created: float = field(default_factory=time.time)
     lock: Any = None
-    reconnect_count: int = 0
-    last_error: Optional[str] = None
-    message_count: int = 0  # 跟踪消息数量
+    message_count: int = 0
 
     def __post_init__(self):
         if self.lock is None:
@@ -199,52 +195,38 @@ class SessionManager:
             del self.sessions[sid]
 
     async def start_heartbeat(self, browser):
-        """启动心跳任务"""
+        """启动心跳任务 - 只做轻量检查"""
         if self._heartbeat_task and not self._heartbeat_task.done():
             return
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(browser))
         logger.info("❤️ 心跳任务已启动")
 
     async def _heartbeat_loop(self, browser):
-        """定期检查会话健康"""
+        """定期检查会话 - 只检查页面是否还活着，不重建"""
         while True:
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
                 now = time.time()
                 async with self._lock:
                     for sid, session in list(self.sessions.items()):
-                        # 只检查最近活跃的会话（30分钟内）
-                        if now - session.last_activity > 1800:
+                        # 只检查活跃会话
+                        if now - session.last_activity > 3600:
                             continue
                         try:
-                            if session.page and not session.page.is_closed():
-                                # 简单 ping 检查
-                                await asyncio.wait_for(
-                                    session.page.evaluate("1 + 1"),
-                                    timeout=5.0
-                                )
-                            else:
-                                # 尝试恢复页面
-                                logger.info(f"🔄 心跳恢复会话 {sid} 的页面")
-                                try:
-                                    await browser.ensure_healthy_page(session)
-                                except Exception as e:
-                                    logger.warning(f"恢复页面失败: {e}")
+                            if session.page:
+                                if session.page.is_closed():
+                                    logger.warning(f"会话 {sid} 页面已关闭")
                                     session.page = None
+                                else:
+                                    # 简单检查
+                                    await asyncio.wait_for(
+                                        session.page.evaluate("1 + 1"),
+                                        timeout=3.0
+                                    )
                         except asyncio.TimeoutError:
-                            logger.warning(f"会话 {sid} 心跳超时，尝试恢复")
-                            try:
-                                await browser.ensure_healthy_page(session)
-                            except Exception as e:
-                                logger.warning(f"恢复页面失败: {e}")
-                                session.page = None
+                            logger.warning(f"会话 {sid} 心跳超时，可能页面卡死")
                         except Exception as e:
                             logger.debug(f"会话 {sid} 心跳检查失败: {e}")
-                            # 尝试恢复
-                            try:
-                                await browser.ensure_healthy_page(session)
-                            except Exception:
-                                session.page = None
             except asyncio.CancelledError:
                 logger.info("心跳任务已取消")
                 break
@@ -270,11 +252,9 @@ class DeepSeekBrowser:
         if self._is_closing:
             raise RuntimeError("浏览器正在关闭")
         
-        # 检查现有连接是否健康
         if self._browser and self._browser.is_connected() and not force_reconnect:
             return
         
-        # 如果需要重新连接
         if force_reconnect or self._browser is None or not self._browser.is_connected():
             self._reconnect_attempts += 1
             if self._reconnect_attempts > self._max_reconnect_attempts:
@@ -284,7 +264,6 @@ class DeepSeekBrowser:
             
             logger.info(f"🔄 重新连接浏览器 (尝试 {self._reconnect_attempts}/{self._max_reconnect_attempts})")
             
-            # 清理旧连接
             await self._cleanup_browser()
             
             try:
@@ -308,7 +287,7 @@ class DeepSeekBrowser:
                 )
                 if storage:
                     logger.info("✅ 已加载登录态")
-                self._reconnect_attempts = 0  # 重置重连计数
+                self._reconnect_attempts = 0
             except Exception as e:
                 logger.error(f"浏览器启动失败: {e}")
                 raise
@@ -346,7 +325,6 @@ class DeepSeekBrowser:
             logger.info("📌 已打开 DeepSeek 页面")
         except Exception as e:
             logger.error(f"打开 DeepSeek 页面失败: {e}")
-            # 尝试重新连接
             await self._ensure(force_reconnect=True)
             page = await self._context.new_page()
             await page.goto(DEEPSEEK_URL, wait_until="domcontentloaded", timeout=30000)
@@ -359,7 +337,6 @@ class DeepSeekBrowser:
                 logger.warning(f"保存登录态失败: {e}")
 
     async def is_page_healthy(self, page=None) -> bool:
-        """检查页面是否健康可用"""
         if page is None:
             if not self._context:
                 return False
@@ -371,80 +348,58 @@ class DeepSeekBrowser:
             return False
         
         try:
-            # 检查页面是否关闭
             if page.is_closed():
                 return False
-            
-            # 检查页面 URL 是否有效
             url = page.url
             if not url or "about:blank" in url:
                 return False
-            
-            # 检查是否有输入框（说明页面已加载）
             textarea = await page.query_selector("textarea")
             if textarea is None:
                 return False
-            
-            # 检查是否在登录页
             if "sign_in" in url:
                 return False
-            
             return True
         except Exception:
             return False
 
-    async def ensure_healthy_page(self, session: ChatSession) -> Any:
-        """确保会话有一个健康的页面，如果没有则创建新的"""
-        # 检查现有页面是否健康
+    async def get_or_create_page(self, session: ChatSession) -> Any:
+        """获取或创建页面 - 不重建现有页面"""
+        # 如果页面存在且未关闭，直接使用
         if session.page and not session.page.is_closed():
             try:
-                healthy = await self.is_page_healthy(session.page)
-                if healthy:
-                    return session.page
+                # 简单检查页面是否可用
+                await session.page.evaluate("1 + 1")
+                return session.page
             except Exception as e:
-                logger.debug(f"页面健康检查异常: {e}")
+                logger.warning(f"页面不可用: {e}")
+                # 页面不可用，需要创建新页面
+                session.page = None
         
         # 需要创建新页面
         logger.info(f"🔄 为会话 {session.session_id} 创建新页面")
         try:
-            # 确保浏览器连接
             await self._ensure()
             
-            # 尝试关闭旧页面
             if session.page and not session.page.is_closed():
                 try:
                     await session.page.close()
                 except Exception:
                     pass
             
-            # 创建新页面
             new_page = await self._context.new_page()
             await new_page.goto(DEEPSEEK_URL, wait_until="domcontentloaded", timeout=30000)
             await self._ensure_fresh(new_page)
             
             session.page = new_page
-            session.sent_hashes = []  # 重置消息历史
-            session.reconnect_count += 1
-            session.last_error = None
+            # 页面是新的，重置已发送消息列表
+            session.sent_message_ids = []
+            session.message_count = 0
             
-            logger.info(f"✅ 会话 {session.session_id} 新页面创建成功 (重连次数: {session.reconnect_count})")
+            logger.info(f"✅ 会话 {session.session_id} 新页面创建成功")
             return new_page
         except Exception as e:
             logger.error(f"创建新页面失败: {e}")
-            # 尝试强制重连浏览器
-            try:
-                await self._ensure(force_reconnect=True)
-                new_page = await self._context.new_page()
-                await new_page.goto(DEEPSEEK_URL, wait_until="domcontentloaded", timeout=30000)
-                await self._ensure_fresh(new_page)
-                session.page = new_page
-                session.sent_hashes = []
-                session.reconnect_count += 1
-                logger.info(f"✅ 强制重连后创建新页面成功")
-                return new_page
-            except Exception as e2:
-                logger.error(f"强制重连后仍失败: {e2}")
-                raise
+            raise
 
     async def check_login(self, page=None) -> bool:
         if self._is_closing:
@@ -668,7 +623,6 @@ class DeepSeekBrowser:
 # ============ JSON 修复与解析 ============
 
 def _repair_multiline_json(s: str) -> str:
-    """修复多行 JSON，但保留换行符（不再转义为 \\n）"""
     out, in_str, esc = [], False, False
     for ch in s:
         if in_str:
@@ -678,7 +632,6 @@ def _repair_multiline_json(s: str) -> str:
                 esc = True; out.append(ch); continue
             if ch == '"':
                 in_str = False; out.append(ch); continue
-            # 保留换行符、回车符、制表符，不转义
             if ch == '\n':
                 out.append('\n')
             elif ch == '\r':
@@ -1062,16 +1015,16 @@ async def _run_completion(session: ChatSession, req: ChatCompletionRequest,
                           schema_map: Dict[str, dict], timeout: int = REPLY_TIMEOUT) -> Dict[str, Any]:
     browser: DeepSeekBrowser = await get_browser()
     async with session.lock:
-        # 确保页面健康
+        # 获取页面（如果页面不存在才创建）
         try:
-            await browser.ensure_healthy_page(session)
+            page = await browser.get_or_create_page(session)
         except Exception as e:
-            logger.error(f"确保健康页面失败: {e}")
-            return {"error": f"无法创建会话页面: {e}"}
+            logger.error(f"获取页面失败: {e}")
+            return {"error": f"无法获取会话页面: {e}"}
 
         # 检查登录状态
         try:
-            if not await browser.check_login(session.page):
+            if not await browser.check_login(page):
                 return {"error": "未登录，请先调用 /login"}
         except Exception as e:
             logger.error(f"检查登录状态失败: {e}")
@@ -1080,51 +1033,66 @@ async def _run_completion(session: ChatSession, req: ChatCompletionRequest,
         if not turns:
             return {"error": "没有有效的用户消息"}
 
-        # 移除哈希检查 - 直接发送所有消息
-        # 如果是新的会话或者需要重置
-        if len(session.sent_hashes) == 0 or req.new_conversation:
-            # 新建对话
+        # 计算消息哈希
+        current_ids = [_turn_hash(role, content) for role, content in turns]
+        sent_ids = set(session.sent_message_ids)
+        
+        # 找出新消息
+        new_messages = []
+        for i, (role, content) in enumerate(turns):
+            if current_ids[i] not in sent_ids:
+                new_messages.append((role, content, current_ids[i]))
+
+        # 如果是新会话或重置，发送所有消息
+        if req.new_conversation or len(session.sent_message_ids) == 0:
             try:
-                await browser.new_conversation(session.page)
-                logger.info(f"开始新对话: {session.session_id}")
+                await browser.new_conversation(page)
+                logger.info(f"🔄 新对话: {session.session_id}")
             except Exception as e:
                 logger.warning(f"新建对话失败: {e}")
             
-            # 发送系统提示（如果有）
             send_turns = []
             if system_text:
                 send_turns.append(("system", system_text))
             send_turns.extend(turns)
-            session.sent_hashes = []  # 重置历史
+            
+            session.sent_message_ids = []
+            
+            for role, content in send_turns:
+                rendered = _render_turn(role, content)
+                await browser._send_message(page, rendered)
+                if role != "system":
+                    session.sent_message_ids.append(_turn_hash(role, content))
+            
+            logger.info(f"发送 {len(send_turns)} 条消息 (新会话)")
+        
+        elif new_messages:
+            # 只发送新消息
+            logger.info(f"📤 发送 {len(new_messages)} 条新消息")
+            
+            for role, content, msg_id in new_messages:
+                rendered = _render_turn(role, content)
+                await browser._send_message(page, rendered)
+                session.sent_message_ids.append(msg_id)
+                session.message_count += 1
+        
         else:
-            # 继续现有对话 - 只发送新消息（但不再检查哈希匹配）
-            # 简单起见，发送所有用户消息
-            send_turns = []
-            if system_text:
-                send_turns.append(("system", system_text))
-            send_turns.extend(turns)
+            # 没有新消息，但可能工具结果需要发送
+            if turns and turns[-1][0] == "tool":
+                role, content = turns[-1]
+                rendered = _render_turn(role, content)
+                await browser._send_message(page, rendered)
+                session.sent_message_ids.append(_turn_hash(role, content))
+            else:
+                # 确实没有新消息，但用户可能想继续对话
+                logger.info(f"ℹ️ 没有新消息，会话状态: {len(session.sent_message_ids)} 条已发送")
+                # 如果有系统提示，发送它
+                if system_text:
+                    rendered = _render_turn("system", system_text)
+                    await browser._send_message(page, rendered)
 
-        if not send_turns:
-            send_turns = [turns[-1]] if turns else [("user", "你好")]
-
-        logger.info(f"发送 {len(send_turns)} 条消息到会话 {session.session_id}")
-        for role, content in send_turns:
-            rendered = _render_turn(role, content)
-            try:
-                await browser._send_message(session.page, rendered)
-            except Exception as e:
-                logger.error(f"发送消息失败: {e}")
-                # 尝试恢复页面
-                try:
-                    await browser.ensure_healthy_page(session)
-                    await browser._send_message(session.page, rendered)
-                except Exception as e2:
-                    return {"error": f"发送消息失败: {e2}"}
-            if role != "system":
-                session.sent_hashes.append(_turn_hash(role, content))
-            session.message_count += 1
-
-        reply = await browser._wait_for_reply(session.page, timeout)
+        # 等待回复
+        reply = await browser._wait_for_reply(page, timeout)
         session.last_activity = time.time()
 
         if "未收到回复" in reply or reply.startswith("超时"):
@@ -1165,13 +1133,12 @@ async def get_browser() -> DeepSeekBrowser:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 启动 DeepSeek Browser API 终极版 (v10.2 会话稳定性修复)...")
+    logger.info("🚀 启动 DeepSeek Browser API 终极版 (v10.4 简化稳定性修复)...")
     browser = None
     try:
         browser = await get_browser()
         await browser._ensure()
         await browser.open_homepage()
-        # 启动心跳
         await session_manager.start_heartbeat(browser)
         logger.info("✅ 服务启动完成")
     except Exception as e:
@@ -1185,8 +1152,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DeepSeek Browser API Ultimate",
-    version="10.2.0",
-    description="OpenAI 兼容代理（浏览器后端）会话稳定性修复版",
+    version="10.4.0",
+    description="OpenAI 兼容代理（浏览器后端）简化稳定性修复版",
     lifespan=lifespan,
 )
 
@@ -1218,7 +1185,7 @@ async def auth_middleware(request: Request, call_next):
 async def root():
     return {
         "service": "DeepSeek Browser API Ultimate",
-        "version": "10.2.0",
+        "version": "10.4.0",
         "status": "running",
         "openai_compatible": True,
         "endpoints": [
@@ -1247,7 +1214,7 @@ async def status():
         logged_in = False
     return {
         "service": "deepseek-browser-ultimate",
-        "version": "10.2.0",
+        "version": "10.4.0",
         "logged_in": logged_in,
         "active_sessions": len(session_manager.sessions),
         "api_keys_configured": bool(_API_KEYS),
@@ -1278,7 +1245,6 @@ async def health():
 
 @app.get("/diagnose")
 async def diagnose():
-    """诊断端点 - 用于调试连接问题"""
     browser = await get_browser()
     result = {
         "browser": {
@@ -1286,7 +1252,6 @@ async def diagnose():
             "connected": browser._browser.is_connected() if browser._browser else False,
             "context_exists": browser._context is not None,
             "is_closing": browser._is_closing,
-            "reconnect_attempts": browser._reconnect_attempts,
         },
         "pages": [],
         "sessions": [],
@@ -1300,17 +1265,10 @@ async def diagnose():
                 try:
                     is_closed = page.is_closed()
                     url = page.url if not is_closed else "closed"
-                    has_textarea = False
-                    if not is_closed:
-                        try:
-                            has_textarea = await page.query_selector("textarea") is not None
-                        except Exception:
-                            pass
                     result["pages"].append({
                         "index": i,
                         "url": url[:100] if url else "unknown",
                         "is_closed": is_closed,
-                        "has_textarea": has_textarea,
                     })
                 except Exception as e:
                     result["pages"].append({"index": i, "error": str(e)})
@@ -1321,11 +1279,9 @@ async def diagnose():
         result["sessions"].append({
             "id": sid,
             "has_page": session.page is not None and not session.page.is_closed() if session.page else False,
-            "sent_turns": len(session.sent_hashes),
+            "sent_messages": len(session.sent_message_ids),
             "message_count": session.message_count,
             "last_activity": session.last_activity,
-            "reconnect_count": session.reconnect_count,
-            "last_error": session.last_error,
             "age_seconds": int(time.time() - session.created),
         })
     
@@ -1387,7 +1343,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         logger.info(f"重置会话: {session_key}")
 
     session, _ = await session_manager.get_or_create(session_key)
-    logger.info(f"使用会话: {session.session_id}, 已发送 {len(session.sent_hashes)} 条消息")
+    logger.info(f"使用会话: {session.session_id}, 已发送 {len(session.sent_message_ids)} 条消息")
 
     try:
         async with browser._concurrency:
@@ -1509,7 +1465,7 @@ async def reset(session_id: Optional[str] = None, request: Request = None):
     browser = await get_browser()
     if session_id:
         session, _ = await session_manager.get_or_create(session_id)
-        session.sent_hashes = []
+        session.sent_message_ids = []
         session.message_count = 0
         if session.page and not session.page.is_closed():
             try:
@@ -1519,7 +1475,7 @@ async def reset(session_id: Optional[str] = None, request: Request = None):
                 pass
     else:
         for s in session_manager.sessions.values():
-            s.sent_hashes = []
+            s.sent_message_ids = []
             s.message_count = 0
     return {"success": True, "message": "对话已重置"}
 
@@ -1539,12 +1495,10 @@ async def list_sessions(request: Request = None):
         sessions_info.append({
             "session_id": sid,
             "has_page": sess.page is not None and not sess.page.is_closed(),
-            "sent_turns": len(sess.sent_hashes),
+            "sent_messages": len(sess.sent_message_ids),
             "message_count": sess.message_count,
             "last_activity": sess.last_activity,
             "created": sess.created,
-            "reconnect_count": sess.reconnect_count,
-            "last_error": sess.last_error,
         })
     return {"sessions": sessions_info, "total": len(sessions_info)}
 
@@ -1564,11 +1518,10 @@ async def inject_prompt(session_id: Optional[str] = None, prompt: Optional[str] 
             "工具结果会以\"工具结果\"形式返回给你。"
         )
     try:
-        # 确保页面健康
-        await browser.ensure_healthy_page(session)
-        await browser.new_conversation(session.page)
-        await browser._send_message(session.page, f"【系统指令】请严格遵守以下规则：\n{prompt}")
-        session.sent_hashes = [_turn_hash("system", prompt)]
+        page = await browser.get_or_create_page(session)
+        await browser.new_conversation(page)
+        await browser._send_message(page, f"【系统指令】请严格遵守以下规则：\n{prompt}")
+        session.sent_message_ids = [_turn_hash("system", prompt)]
         await asyncio.sleep(2)
         return JSONResponse({
             "success": True,
@@ -1613,14 +1566,11 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🟢 DeepSeek Browser API 终极版 v10.2 (会话稳定性修复)")
+    print("🟢 DeepSeek Browser API 终极版 v10.4 (简化稳定性修复)")
     print("=" * 60)
     print(f"📌 http://{HOST}:{PORT}")
     print(f"🔑 鉴权: {'开启' if _API_KEYS else '关闭（默认安全）'}")
     print(f"❤️ 心跳间隔: {HEARTBEAT_INTERVAL}s")
     print(f"⏰ 会话超时: {SESSION_TIMEOUT}s ({SESSION_TIMEOUT//3600}小时)")
-    print(f"📌 POST /v1/chat/completions  (OpenAI 标准格式)")
-    print(f"📌 GET  /v1/models,  /status,  /sessions,  /diagnose")
     print("=" * 60)
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
-    
