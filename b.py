@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepSeek Browser API - OpenAI 兼容代理 终极版 v10.1 (稳定性修复版)
+DeepSeek Browser API - OpenAI 兼容代理 终极版 v10.2 (会话稳定性修复)
 ================================================================
 修复内容：
-- 增强页面健康检查与自动恢复
-- 会话心跳保活机制
-- 连接失败自动重试
-- 更稳健的错误处理
-- 诊断端点便于调试
+- 移除过于严格的哈希匹配检查
+- 会话超时时间延长到24小时
+- 会话自动恢复机制增强
+- 页面健康检查更宽容
 """
 import os
 import sys
@@ -76,12 +75,12 @@ STORAGE_FILE = DATA_DIR / "storage.json"
 DEEPSEEK_URL = "https://chat.deepseek.com/"
 
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "100"))
-SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "3600"))
+SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "86400"))  # 改为24小时
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "4"))
 REPLY_TIMEOUT = int(os.environ.get("REPLY_TIMEOUT", "300"))
 LOGIN_TIMEOUT = int(os.environ.get("LOGIN_TIMEOUT", "300"))
 MAX_REQUEST_SIZE = int(os.environ.get("MAX_REQUEST_SIZE", str(10 * 1024 * 1024)))
-HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))  # 改为60秒
 
 _UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "sk-admin")
 
@@ -128,6 +127,7 @@ class ChatSession:
     lock: Any = None
     reconnect_count: int = 0
     last_error: Optional[str] = None
+    message_count: int = 0  # 跟踪消息数量
 
     def __post_init__(self):
         if self.lock is None:
@@ -213,8 +213,8 @@ class SessionManager:
                 now = time.time()
                 async with self._lock:
                     for sid, session in list(self.sessions.items()):
-                        # 只检查最近活跃的会话（5分钟内）
-                        if now - session.last_activity > 300:
+                        # 只检查最近活跃的会话（30分钟内）
+                        if now - session.last_activity > 1800:
                             continue
                         try:
                             if session.page and not session.page.is_closed():
@@ -224,14 +224,27 @@ class SessionManager:
                                     timeout=5.0
                                 )
                             else:
-                                session.page = None
-                                logger.debug(f"会话 {sid} 页面已关闭，标记为待重建")
+                                # 尝试恢复页面
+                                logger.info(f"🔄 心跳恢复会话 {sid} 的页面")
+                                try:
+                                    await browser.ensure_healthy_page(session)
+                                except Exception as e:
+                                    logger.warning(f"恢复页面失败: {e}")
+                                    session.page = None
                         except asyncio.TimeoutError:
-                            logger.warning(f"会话 {sid} 心跳超时，页面可能无响应")
-                            session.page = None
+                            logger.warning(f"会话 {sid} 心跳超时，尝试恢复")
+                            try:
+                                await browser.ensure_healthy_page(session)
+                            except Exception as e:
+                                logger.warning(f"恢复页面失败: {e}")
+                                session.page = None
                         except Exception as e:
                             logger.debug(f"会话 {sid} 心跳检查失败: {e}")
-                            session.page = None
+                            # 尝试恢复
+                            try:
+                                await browser.ensure_healthy_page(session)
+                            except Exception:
+                                session.page = None
             except asyncio.CancelledError:
                 logger.info("心跳任务已取消")
                 break
@@ -1067,30 +1080,29 @@ async def _run_completion(session: ChatSession, req: ChatCompletionRequest,
         if not turns:
             return {"error": "没有有效的用户消息"}
 
-        hashes = [_turn_hash(r, c) for r, c in turns]
-        sent = session.sent_hashes
-
-        reset_needed = False
-        if sent and hashes[:len(sent)] != sent:
-            logger.info(f"会话哈希不匹配，重置对话 (sent={len(sent)}, new={len(hashes)})")
-            reset_needed = True
-
-        # 如果是新页面或需要重置，清空对话
-        if len(sent) == 0 or reset_needed:
-            if reset_needed:
-                try:
-                    await browser.new_conversation(session.page)
-                    logger.info(f"重置对话页面: {session.session_id}")
-                except Exception as e:
-                    logger.warning(f"重置对话失败: {e}")
-            session.sent_hashes = []
+        # 移除哈希检查 - 直接发送所有消息
+        # 如果是新的会话或者需要重置
+        if len(session.sent_hashes) == 0 or req.new_conversation:
+            # 新建对话
+            try:
+                await browser.new_conversation(session.page)
+                logger.info(f"开始新对话: {session.session_id}")
+            except Exception as e:
+                logger.warning(f"新建对话失败: {e}")
+            
+            # 发送系统提示（如果有）
             send_turns = []
             if system_text:
                 send_turns.append(("system", system_text))
             send_turns.extend(turns)
+            session.sent_hashes = []  # 重置历史
         else:
-            new_turns = turns[len(sent):]
-            send_turns = new_turns
+            # 继续现有对话 - 只发送新消息（但不再检查哈希匹配）
+            # 简单起见，发送所有用户消息
+            send_turns = []
+            if system_text:
+                send_turns.append(("system", system_text))
+            send_turns.extend(turns)
 
         if not send_turns:
             send_turns = [turns[-1]] if turns else [("user", "你好")]
@@ -1110,6 +1122,7 @@ async def _run_completion(session: ChatSession, req: ChatCompletionRequest,
                     return {"error": f"发送消息失败: {e2}"}
             if role != "system":
                 session.sent_hashes.append(_turn_hash(role, content))
+            session.message_count += 1
 
         reply = await browser._wait_for_reply(session.page, timeout)
         session.last_activity = time.time()
@@ -1152,7 +1165,7 @@ async def get_browser() -> DeepSeekBrowser:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 启动 DeepSeek Browser API 终极版 (v10.1 稳定性修复)...")
+    logger.info("🚀 启动 DeepSeek Browser API 终极版 (v10.2 会话稳定性修复)...")
     browser = None
     try:
         browser = await get_browser()
@@ -1172,8 +1185,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DeepSeek Browser API Ultimate",
-    version="10.1.0",
-    description="OpenAI 兼容代理（浏览器后端）稳定性修复版",
+    version="10.2.0",
+    description="OpenAI 兼容代理（浏览器后端）会话稳定性修复版",
     lifespan=lifespan,
 )
 
@@ -1205,7 +1218,7 @@ async def auth_middleware(request: Request, call_next):
 async def root():
     return {
         "service": "DeepSeek Browser API Ultimate",
-        "version": "10.1.0",
+        "version": "10.2.0",
         "status": "running",
         "openai_compatible": True,
         "endpoints": [
@@ -1234,7 +1247,7 @@ async def status():
         logged_in = False
     return {
         "service": "deepseek-browser-ultimate",
-        "version": "10.1.0",
+        "version": "10.2.0",
         "logged_in": logged_in,
         "active_sessions": len(session_manager.sessions),
         "api_keys_configured": bool(_API_KEYS),
@@ -1242,6 +1255,7 @@ async def status():
         "max_sessions": MAX_SESSIONS,
         "max_concurrent": MAX_CONCURRENT,
         "heartbeat_interval": HEARTBEAT_INTERVAL,
+        "session_timeout": SESSION_TIMEOUT,
     }
 
 
@@ -1308,6 +1322,7 @@ async def diagnose():
             "id": sid,
             "has_page": session.page is not None and not session.page.is_closed() if session.page else False,
             "sent_turns": len(session.sent_hashes),
+            "message_count": session.message_count,
             "last_activity": session.last_activity,
             "reconnect_count": session.reconnect_count,
             "last_error": session.last_error,
@@ -1495,6 +1510,7 @@ async def reset(session_id: Optional[str] = None, request: Request = None):
     if session_id:
         session, _ = await session_manager.get_or_create(session_id)
         session.sent_hashes = []
+        session.message_count = 0
         if session.page and not session.page.is_closed():
             try:
                 await browser.new_conversation(session.page)
@@ -1504,6 +1520,7 @@ async def reset(session_id: Optional[str] = None, request: Request = None):
     else:
         for s in session_manager.sessions.values():
             s.sent_hashes = []
+            s.message_count = 0
     return {"success": True, "message": "对话已重置"}
 
 
@@ -1523,6 +1540,7 @@ async def list_sessions(request: Request = None):
             "session_id": sid,
             "has_page": sess.page is not None and not sess.page.is_closed(),
             "sent_turns": len(sess.sent_hashes),
+            "message_count": sess.message_count,
             "last_activity": sess.last_activity,
             "created": sess.created,
             "reconnect_count": sess.reconnect_count,
@@ -1595,12 +1613,14 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🟢 DeepSeek Browser API 终极版 v10.1 (稳定性修复)")
+    print("🟢 DeepSeek Browser API 终极版 v10.2 (会话稳定性修复)")
     print("=" * 60)
     print(f"📌 http://{HOST}:{PORT}")
     print(f"🔑 鉴权: {'开启' if _API_KEYS else '关闭（默认安全）'}")
     print(f"❤️ 心跳间隔: {HEARTBEAT_INTERVAL}s")
+    print(f"⏰ 会话超时: {SESSION_TIMEOUT}s ({SESSION_TIMEOUT//3600}小时)")
     print(f"📌 POST /v1/chat/completions  (OpenAI 标准格式)")
     print(f"📌 GET  /v1/models,  /status,  /sessions,  /diagnose")
     print("=" * 60)
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    
