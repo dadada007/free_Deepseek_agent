@@ -1,0 +1,108 @@
+{
+  "goal": "将 tools.py 拆分为模块化的 tools/ 目录结构",
+  "updated_at": "2026-08-16T15:33:50.816623",
+  "tasks": [
+    {
+      "id": "1",
+      "description": "创建 tools/ 目录和 __init__.py",
+      "dependencies": [],
+      "status": "in_progress",
+      "result": "开始执行：创建 tools/ 目录和 __init__.py"
+    },
+    {
+      "id": "2",
+      "description": "创建 tools/utils.py（辅助函数：_fuzzy_find_file、_edit_distance、_syntax_check、_repair_py_string_newlines、_write_atomic、_read_with_encoding、_should_ignore）",
+      "dependencies": [],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "3",
+      "description": "创建 tools/registry.py（TOOLS 字典、register()、get_schemas()、build_system_prompt()、execute()、parse_markdown_blocks()、auto_write_from_markdown()）",
+      "dependencies": [
+        "2"
+      ],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "4",
+      "description": "创建 tools/file_tools.py（read_file、write_file、list_dir、delete_file、rename_file、append_file、edit_file）",
+      "dependencies": [
+        "2"
+      ],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "5",
+      "description": "创建 tools/terminal_tools.py（terminal、run_background、task_output、kill_task 及 _BgTask 相关）",
+      "dependencies": [],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "6",
+      "description": "创建 tools/web_tools.py（web_fetch）",
+      "dependencies": [],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "7",
+      "description": "创建 tools/search_tools.py（glob、grep）",
+      "dependencies": [
+        "2"
+      ],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "8",
+      "description": "创建 tools/todo_tools.py（todo_add、todo_start、todo_complete、todo_list）",
+      "dependencies": [],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "9",
+      "description": "创建 tools/smart_reader_wrap.py（read_file_by_chunks、get_file_summary、cache_file、clear_file_cache 包装）",
+      "dependencies": [],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "10",
+      "description": "更新 tools/__init__.py 导出所有工具函数和注册表",
+      "dependencies": [
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9"
+      ],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "11",
+      "description": "修改原 tools.py 为兼容入口（导入新模块并重新导出，保持向后兼容）",
+      "dependencies": [
+        "10"
+      ],
+      "status": "pending",
+      "result": ""
+    },
+    {
+      "id": "12",
+      "description": "验证：运行测试确保所有工具仍可正常调用",
+      "dependencies": [
+        "11"
+      ],
+      "status": "pending",
+      "result": ""
+    }
+  ]
+}
