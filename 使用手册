@@ -1,0 +1,8 @@
+先启动：
+python b.py
+
+python g2.py
+
+#b.py,g2.py是deepseek浏览器服务器和网关，兼容式 openai api接口
+
+python run.py 启动。即可免费畅玩。。。
